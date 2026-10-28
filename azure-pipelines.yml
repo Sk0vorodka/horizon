@@ -1,0 +1,28 @@
+trigger:
+  branches:
+    include:
+      - main
+      - feat/elyby
+  tags:
+    include:
+      - "*"
+
+pool:
+  vmImage: windows-latest
+
+steps:
+  - checkout: self
+
+  - pwsh: |
+      if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+        Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile "$env:TEMP\rustup-init.exe"
+        & "$env:TEMP\rustup-init.exe" -y --profile minimal --default-toolchain stable
+      }
+      $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
+      rustup default stable
+      cargo build --release --manifest-path launcher/Cargo.toml
+      Get-Item launcher/target/release/horizon-launcher.exe | Select-Object FullName,Length
+    displayName: Build launcher (release)
+
+  - publish: launcher/target/release/horizon-launcher.exe
+    artifact: horizon-launcher-windows
