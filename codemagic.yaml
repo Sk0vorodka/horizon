@@ -11,22 +11,21 @@ workflows:
     max_build_duration: 120
     environment:
       vars:
-        RUSTUP_TOOLCHAIN: stable
         CARGO_TERM_COLOR: never
     scripts:
-      - name: Install Rust Windows GNU target
+      - name: Install toolchain and build launcher (Windows x64, release)
         script: |
-          rustup target add x86_64-pc-windows-gnu --toolchain stable
-      - name: Install MinGW-w64 cross toolchain
-        script: |
+          set -euo pipefail
           export HOMEBREW_NO_AUTO_UPDATE=1
           if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
             brew install mingw-w64
           fi
-          x86_64-w64-mingw32-gcc --version | head -1
-      - name: Build launcher (Windows x64, release)
-        script: |
-          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl -sSf https://sh.rustup.rs | sh -s -- -y
+          fi
+          source "$HOME/.cargo/env"
+          rustup default stable
+          rustup target add x86_64-pc-windows-gnu
           # Statically link the MinGW runtime so the .exe carries no gcc/winpthread DLLs.
           export RUSTFLAGS="-C target-feature=+crt-static"
           export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
