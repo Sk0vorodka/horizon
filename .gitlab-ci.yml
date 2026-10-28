@@ -1,0 +1,27 @@
+# GitLab CI: build the Horizon launcher for Windows x64 by cross-compiling
+# from Linux (MinGW-w64). The launcher is a separate cargo workspace
+# (`launcher/`) excluded from the root game workspace.
+
+image: rust:latest
+
+variables:
+  CARGO_TERM_COLOR: never
+  RUSTFLAGS: "-C target-feature=+crt-static"
+
+stages:
+  - build
+
+launcher-windows:
+  stage: build
+  tags: []
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+    - rustup target add x86_64-pc-windows-gnu
+  script:
+    - export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
+    - cargo build --release --manifest-path launcher/Cargo.toml --target x86_64-pc-windows-gnu
+    - ls -la launcher/target/x86_64-pc-windows-gnu/release/horizon-launcher.exe
+  artifacts:
+    paths:
+      - launcher/target/x86_64-pc-windows-gnu/release/horizon-launcher.exe
+    expire_in: 1 week
