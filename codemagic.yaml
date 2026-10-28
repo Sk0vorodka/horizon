@@ -1,37 +1,28 @@
 # Codemagic build for the Horizon launcher (Windows x64).
 #
-# Cross-compiles the Rust launcher to `x86_64-pc-windows-gnu` on a macOS builder
-# using the MinGW-w64 toolchain. The launcher is a separate cargo workspace
-# (`launcher/`), excluded from the root game workspace.
+# Build natively on a Windows 2022 runner (MSVC Build Tools preinstalled).
+# The launcher is a separate cargo workspace (`launcher/`) excluded from the
+# root game workspace.
 
 workflows:
   launcher-windows:
     name: Horizon Launcher (Windows x64)
-    instance_type: mac_mini_m2
+    instance_type: windows_x2
     max_build_duration: 120
     environment:
       vars:
         CARGO_TERM_COLOR: never
     scripts:
-      - name: Install toolchain and build launcher (Windows x64, release)
+      - name: Install Rust and build launcher (release)
         script: |
           set -euo pipefail
-          export HOMEBREW_NO_AUTO_UPDATE=1
-          if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
-            brew install mingw-w64
-          fi
           if ! command -v rustup >/dev/null 2>&1; then
-            curl -sSf https://sh.rustup.rs | sh -s -- -y
+            curl -sSf -o "$TEMP/rustup-init.exe" https://win.rustup.rs/x86_64
+            "$TEMP/rustup-init.exe" -y --default-toolchain stable --profile minimal
           fi
-          source "$HOME/.cargo/env"
+          export PATH="$USERPROFILE/.cargo/bin:$PATH"
           rustup default stable
-          rustup target add x86_64-pc-windows-gnu
-          # Statically link the MinGW runtime so the .exe carries no gcc/winpthread DLLs.
-          export RUSTFLAGS="-C target-feature=+crt-static"
-          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
-          cargo build --release \
-            --manifest-path launcher/Cargo.toml \
-            --target x86_64-pc-windows-gnu
-          ls -la launcher/target/x86_64-pc-windows-gnu/release/horizon-launcher.exe
+          cargo build --release --manifest-path launcher/Cargo.toml
+          ls -la launcher/target/release/horizon-launcher.exe
     artifacts:
-      - launcher/target/x86_64-pc-windows-gnu/release/horizon-launcher.exe
+      - launcher/target/release/horizon-launcher.exe
