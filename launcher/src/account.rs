@@ -5,17 +5,36 @@
 //! reads once (`--session-file`), never on its command line. Tokens never reach logs, errors or
 //! output.
 //!
+//! Ely.by accounts (`elyby`): the same launcher, the other account service (docs.ely.by). Their
+//! sign-in is a login and a password instead of a browser code, their session file says
+//! `user_type: "elyby"`, and their tokens live in the keychain under the same account's key.
+//!
 //! The owner gate ([`launch`]): the launcher starts the game only while an account in it owns
 //! Minecraft: Java Edition, as other launchers do. Offline names play behind such an account.
-//! The game binary itself, its harnesses and the servers don't go through the launcher's gate.
+//! An ely.by account is its own kind of owner: ely.by serves players without a Microsoft
+//! account, and its sessions play the same way. The game binary itself, its harnesses and the
+//! servers don't go through the launcher's gate.
 //!
 //! The Azure app (client ID) is Horizon's own and is configuration: `HORIZON_MSA_CLIENT_ID` at
 //! build time, or at run time to override it. Without one, sign-in says it is not configured.
+pub mod elyby;
+
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Which account service the account is signed in with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountKind {
+    #[default]
+    #[serde(rename = "msa")]
+    Microsoft,
+    #[serde(rename = "elyby")]
+    Elyby,
+}
 
 /// The keychain service name every secret is stored under.
 pub const SERVICE: &str = "dev.playhorizon.launcher";
@@ -403,6 +422,9 @@ pub struct Account {
     pub skin: Option<(String, String)>,
     #[serde(default)]
     pub cape: Option<String>,
+    /// Which service the account belongs to (Microsoft by default, for old files).
+    #[serde(default)]
+    pub kind: AccountKind,
 }
 
 /// The profile; none when the account has none (it doesn't own the game, or never made one).
@@ -442,11 +464,16 @@ fn profile(ep: &Endpoints, token: &str) -> Result<Option<Account>, String> {
             ))
         }),
         cape: active("capes").and_then(|c| str_field(&c, "url")),
+        kind: AccountKind::Microsoft,
     }))
 }
 
-/// What the keychain keeps for one account.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+/// What the keychain keeps for one account. The Microsoft accounts' fields are the
+/// refresh token, the Minecraft access token, its expiry, the XUID and the last ownership
+/// answer; an ely.by account keeps its access token in `minecraft_token` and its client token
+/// in `client_token` (the Yggdrasil protocol: refresh answers only the pair, so the launcher
+/// never stores the password).
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Secrets {
     refresh_token: String,
     minecraft_token: String,
@@ -458,6 +485,9 @@ pub struct Secrets {
     /// existed passed the same check at sign-in, which refuses everyone else.
     #[serde(default = "owned_at_sign_in")]
     owns: bool,
+    /// The ely.by client token this access token was minted for (none on a Microsoft account).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_token: Option<String>,
 }
 fn owned_at_sign_in() -> bool {
     true
@@ -465,6 +495,44 @@ fn owned_at_sign_in() -> bool {
 impl std::fmt::Debug for Secrets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Secrets(<hidden>)")
+    }
+}
+
+impl Secrets {
+    fn new(refresh_token: String, mc: Minecraft) -> Self {
+        Self {
+            refresh_token,
+            minecraft_token: mc.token,
+            minecraft_expires_at: mc.expires_at,
+            xuid: mc.xuid,
+            owns: true,
+            client_token: None,
+        }
+    }
+    /// The ely.by secrets: the access token and the client token it was minted for.
+    pub fn elyby(access_token: String, client_token: String) -> Self {
+        Self {
+            refresh_token: String::new(),
+            minecraft_token: access_token,
+            // ely.by tokens don't report an expiry; the launcher asks ely.by to renew them
+            // when it starts the game (see `check`).
+            minecraft_expires_at: 0,
+            xuid: None,
+            owns: true,
+            client_token: Some(client_token),
+        }
+    }
+    /// The account's ely.by client token, if this is an ely.by account.
+    pub fn ely_client_token(&self) -> Option<&str> {
+        self.client_token.as_deref()
+    }
+    /// Whether this is an ely.by account (its client token is set).
+    pub fn is_elyby(&self) -> bool {
+        self.client_token.is_some()
+    }
+    /// The game's access token, whatever account it is.
+    pub fn access_token(&self) -> &str {
+        &self.minecraft_token
     }
 }
 
@@ -478,18 +546,6 @@ pub fn finish_sign_in(ep: &Endpoints, ms: MsTokens) -> Result<(Account, Secrets)
     Ok((account, Secrets::new(ms.refresh, mc)))
 }
 
-impl Secrets {
-    fn new(refresh_token: String, mc: Minecraft) -> Self {
-        Self {
-            refresh_token,
-            minecraft_token: mc.token,
-            minecraft_expires_at: mc.expires_at,
-            xuid: mc.xuid,
-            owns: true,
-        }
-    }
-}
-
 /// What asking the Minecraft services again found for one account.
 enum Check {
     /// It owns the game: its profile as it is now (the name may have changed) and its tokens.
@@ -500,9 +556,17 @@ enum Check {
     NoAnswer(String, Secrets),
 }
 
-/// Asks whether `account` owns the game, with a Minecraft token renewed through the refresh token
-/// first when it has less than an hour left. The secrets come back renewed whatever the answer.
+/// Asks whether `account` owns the game, with a token renewed through the appropriate
+/// service (Microsoft or ely.by) first when it might be stale. The secrets come back
+/// renewed whatever the answer.
 fn check(ep: &Endpoints, client_id: Option<&str>, account: &Account, secrets: Secrets) -> Check {
+    // ely.by accounts don't "own" the game via Microsoft entitlements; they are their own
+    // kind of owner (the launcher never hands out Mojang's files: the download gate below
+    // still needs a Microsoft owner). The token is checked against ely.by.
+    if account.kind == AccountKind::Elyby {
+        return check_elyby(account, secrets);
+    }
+    // Microsoft accounts: the original logic.
     let mut secrets = secrets;
     if secrets.minecraft_expires_at <= now() + RENEW_BEFORE {
         let renewed = client_id
@@ -533,6 +597,29 @@ fn check(ep: &Endpoints, client_id: Option<&str>, account: &Account, secrets: Se
                 owns: true,
                 ..secrets
             },
+        ),
+    }
+}
+
+/// ely.by account check: renew the token against ely.by's auth/refresh, then accept it
+/// as a valid owner (ely.by is an alternative account service; the launcher doesn't gate
+/// the game on Mojang entitlements for these accounts).
+fn check_elyby(account: &Account, mut secrets: Secrets) -> Check {
+    // ely.by tokens don't carry an expiry; refresh at each launch to validate.
+    if secrets.ely_client_token().is_none() {
+        return Check::NoAnswer(
+            "This ely.by account is missing its client token. Sign in again.".into(),
+            secrets,
+        );
+    }
+    match crate::account::elyby::refresh(&secrets) {
+        Ok(renewed) => {
+            secrets = renewed;
+            Check::Owns(account.clone(), secrets)
+        }
+        Err(e) => Check::NoAnswer(
+            format!("Could not reach ely.by to renew the session: {e}"),
+            secrets,
         ),
     }
 }
@@ -788,7 +875,7 @@ const OFFLINE_NEEDS_OWNER: &str =
     "Offline names need a Microsoft account that owns Minecraft: Java Edition in the launcher.";
 
 /// The secrets an account keeps in `store`, if it still has them there.
-fn secrets_in(store: &dyn SecretStore, uuid: &str) -> Option<Secrets> {
+pub fn secrets_in(store: &dyn SecretStore, uuid: &str) -> Option<Secrets> {
     store
         .get(uuid)
         .ok()
@@ -1027,7 +1114,12 @@ pub fn launch(
                 if plays {
                     pass.session = Some((renewed.clone(), secrets.clone()));
                 }
-                pass.owner = Some((renewed, secrets.clone()));
+                // Only a Microsoft account may download the game from Mojang: an ely.by
+                // account is a player owner, not a Mojang one (the launcher never hands out
+                // Mojang's files itself).
+                if renewed.kind == AccountKind::Microsoft {
+                    pass.owner = Some((renewed, secrets.clone()));
+                }
                 (None, secrets)
             }
             Check::DoesNot(secrets) => (Some(DOES_NOT_OWN.to_string()), secrets),
@@ -1083,11 +1175,15 @@ pub fn write_session_file(
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(&path).map_err(|e| e.to_string())?;
+    let user_type = match account.kind {
+        AccountKind::Elyby => "elyby",
+        AccountKind::Microsoft => "msa",
+    };
     let body = json!({
         "name": account.name,
         "uuid": account.uuid,
         "access_token": secrets.minecraft_token,
-        "user_type": "msa",
+        "user_type": user_type,
         "xuid": secrets.xuid,
     });
     std::io::Write::write_all(&mut file, body.to_string().as_bytes()).map_err(|e| e.to_string())?;

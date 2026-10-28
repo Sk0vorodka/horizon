@@ -1,8 +1,12 @@
-//! The Microsoft account the launcher signed in, handed over in a session
+//! The account the launcher signed in, handed over in a session
 //! file (docs/microsoft-account.md), and the Minecraft services call
 //! online-mode servers need: authlib's MinecraftServicesSessionService.joinServer
 //! through the services discovery document. The access token stays in this
 //! process's memory: it is never logged, printed or written anywhere.
+//!
+//! Ely.by accounts (`user_type: "elyby"`) are the other kind the launcher
+//! writes: the same session file form, with the ely.by authserver as the
+//! session service (docs.ely.by, "Authentication for Minecraft").
 use std::{
     path::Path,
     sync::{Arc, Mutex, OnceLock},
@@ -11,14 +15,39 @@ use std::{
 
 /// MinecraftServicesEnvironment.PROD.
 pub const DEFAULT_DISCOVERY: &str = "https://discovery.minecraftservices.com/minecraft/client";
+/// The ely.by authserver (authlib-injector's `ely.by` metadata): the session
+/// service for `elyby` sessions, with ely.by's own join/hasJoined.
+pub const ELYBY_AUTHSERVER: &str = "https://authserver.ely.by";
 /// A session file older than this is refused: it can't be replayed later.
 const MAX_SESSION_FILE_AGE: Duration = Duration::from_secs(120);
 
-/// A signed-in account (vanilla's User with type msa).
+/// Which account kind a session file holds: `msa` (a Microsoft account, the
+/// Minecraft services) or `elyby` (ely.by's authserver).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccountKind {
+    Msa,
+    Elyby,
+}
+
+impl AccountKind {
+    fn from_user_type(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None => Ok(Self::Msa),
+            Some("msa") => Ok(Self::Msa),
+            Some("elyby") => Ok(Self::Elyby),
+            Some(other) => Err(format!(
+                "the session file's account type ({other}) is neither a Microsoft account nor ely.by"
+            )),
+        }
+    }
+}
+
+/// A signed-in account (vanilla's User with type msa or elyby).
 pub struct AuthSession {
     pub name: String,
     pub uuid: u128,
     pub xuid: Option<String>,
+    pub kind: AccountKind,
     access_token: String,
 }
 impl std::fmt::Debug for AuthSession {
@@ -27,7 +56,7 @@ impl std::fmt::Debug for AuthSession {
             .field("name", &self.name)
             .field("uuid", &horizon_protocol::crypto::uuid_string(self.uuid))
             .field("access_token", &"<hidden>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -46,10 +75,23 @@ impl AuthSession {
             name: name.to_owned(),
             uuid,
             xuid: None,
+            kind: AccountKind::Msa,
+            access_token: access_token.to_owned(),
+        }
+    }
+    /// An ely.by session, for tests and harnesses.
+    pub fn new_elyby(name: &str, uuid: u128, access_token: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            uuid,
+            xuid: None,
+            kind: AccountKind::Elyby,
             access_token: access_token.to_owned(),
         }
     }
     /// The session file's JSON: {"name", "uuid", "access_token", "user_type": "msa", "xuid"}.
+    /// `user_type` may also be "elyby" (an ely.by account, session file of the
+    /// same form); nothing means msa, the launcher's older files.
     pub fn parse(text: &str) -> Result<Self, String> {
         let v: serde_json::Value =
             serde_json::from_str(text).map_err(|_| "the session file is not valid JSON")?;
@@ -64,13 +106,11 @@ impl AuthSession {
         let access_token = field("access_token")
             .filter(|t| !t.is_empty())
             .ok_or("the session file has no access token")?;
-        if field("user_type").is_some_and(|t| t != "msa") {
-            return Err("the session file is not a Microsoft account session".into());
-        }
         Ok(Self {
             name: name.to_owned(),
             uuid,
             xuid: field("xuid").map(str::to_owned),
+            kind: AccountKind::from_user_type(field("user_type"))?,
             access_token: access_token.to_owned(),
         })
     }
@@ -214,10 +254,16 @@ pub fn join_request(session: &AuthSession, server_hash: &str) -> String {
 }
 
 /// MinecraftServicesSessionService.joinServer: tell the session service this
-/// account is joining the server whose hash is `server_hash`.
+/// account is joining the server whose hash is `server_hash`. An ely.by
+/// account asks the ely.by authserver instead (the same POST body).
 pub fn join_server(session: &AuthSession, server_hash: &str) -> Result<(), JoinError> {
-    let doc = discovery()?;
-    let url = endpoint(&doc, "session", "join").ok_or(JoinError::Unavailable)?;
+    let url = match session.kind {
+        AccountKind::Msa => {
+            let doc = discovery()?;
+            endpoint(&doc, "session", "join").ok_or(JoinError::Unavailable)?
+        }
+        AccountKind::Elyby => format!("{ELYBY_AUTHSERVER}/session/join"),
+    };
     match agent()
         .post(&url)
         .set("Content-Type", "application/json; charset=utf-8")
@@ -259,6 +305,11 @@ fn url_encode(text: &str) -> String {
 /// whether `name` joined with `server_hash` (and from `ip`, when the server
 /// prevents proxy connections). `Ok(None)`: it didn't, or the service said
 /// no; `Err(Unavailable)`: no answer.
+///
+/// A Horizon server with an ely.by player joining: the ely.by session service
+/// is asked when Mojang's has no such player (authlib-injector's servers ask
+/// their one service; a Horizon host serves both kinds of account), so a
+/// Horizon online-mode server admits Microsoft and ely.by players alike.
 pub fn has_joined(
     name: &str,
     server_hash: &str,
@@ -266,6 +317,29 @@ pub fn has_joined(
 ) -> Result<Option<JoinedProfile>, JoinError> {
     let doc = discovery()?;
     let url = endpoint(&doc, "session", "verify").ok_or(JoinError::Unavailable)?;
+    let query = has_joined_query(name, server_hash, ip);
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let body = match agent().get(&format!("{url}{separator}{query}")).call() {
+        Ok(response) => response.into_string().unwrap_or_default(),
+        Err(ureq::Error::Status(status, response)) => {
+            let error =
+                JoinError::from_response(status, &response.into_string().unwrap_or_default());
+            return match error {
+                JoinError::Unavailable => Err(error),
+                _ => Ok(None),
+            };
+        }
+        Err(ureq::Error::Transport(_)) => return Err(JoinError::Unavailable),
+    };
+    if parse_joined(&body).is_some() {
+        return Ok(parse_joined(&body));
+    }
+    // Not a Mojang profile: an ely.by player may be joining.
+    elyby_has_joined(name, server_hash, ip)
+}
+
+/// The hasJoined query string: `username`, `serverId` and `ip` when asked.
+fn has_joined_query(name: &str, server_hash: &str, ip: Option<std::net::IpAddr>) -> String {
     let mut query = format!(
         "username={}&serverId={}",
         url_encode(name),
@@ -274,8 +348,21 @@ pub fn has_joined(
     if let Some(ip) = ip {
         query.push_str(&format!("&ip={}", url_encode(&ip.to_string())));
     }
-    let separator = if url.contains('?') { '&' } else { '?' };
-    let body = match agent().get(&format!("{url}{separator}{query}")).call() {
+    query
+}
+
+/// Ely.by's hasJoined (`GET /session/hasJoined`), the same query and answer
+/// shape as the Minecraft services'.
+fn elyby_has_joined(
+    name: &str,
+    server_hash: &str,
+    ip: Option<std::net::IpAddr>,
+) -> Result<Option<JoinedProfile>, JoinError> {
+    let query = has_joined_query(name, server_hash, ip);
+    let body = match agent()
+        .get(&format!("{ELYBY_AUTHSERVER}/session/hasJoined?{query}"))
+        .call()
+    {
         Ok(response) => response.into_string().unwrap_or_default(),
         Err(ureq::Error::Status(status, response)) => {
             let error =
@@ -434,5 +521,50 @@ mod tests {
             Some("https://s/join")
         );
         assert_eq!(endpoint(&doc, "session", "verify"), None);
+    }
+
+    #[test]
+    fn elyby_session_files() {
+        let s = AuthSession::parse(r#"{"name":"Steve","uuid":"069a79f444e94726a5befca90e38aaf5","access_token":"ely-token","user_type":"elyby"}"#).unwrap();
+        assert_eq!(s.kind, AccountKind::Elyby);
+        assert_eq!(s.name, "Steve");
+        assert_eq!(s.uuid, UUID);
+        // Without a user_type the file is a Microsoft account's, as before.
+        let msa = AuthSession::parse(
+            r#"{"name":"A","uuid":"069a79f444e94726a5befca90e38aaf5","access_token":"t"}"#,
+        )
+        .unwrap();
+        assert_eq!(msa.kind, AccountKind::Msa);
+        assert_eq!(
+            AuthSession::parse(
+                r#"{"name":"A","uuid":"069a79f444e94726a5befca90e38aaf5","access_token":"t","user_type":"mojang"}"#
+            )
+            .unwrap_err(),
+            "the session file's account type (mojang) is neither a Microsoft account nor ely.by"
+        );
+    }
+
+    #[test]
+    fn elyby_join_request_has_the_same_shape() {
+        let s = AuthSession::new_elyby("Steve", UUID, "ely-token");
+        let v: serde_json::Value = serde_json::from_str(&join_request(&s, "abc")).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"accessToken": "ely-token", "selectedProfile": "069a79f444e94726a5befca90e38aaf5", "serverId": "abc"})
+        );
+    }
+
+    #[test]
+    fn has_joined_query_includes_ip_when_asked() {
+        use std::net::IpAddr;
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        assert_eq!(
+            has_joined_query("Tester_1", "-7c9d", None),
+            "username=Tester_1&serverId=-7c9d"
+        );
+        assert_eq!(
+            has_joined_query("Tester_1", "-7c9d", Some(ip)),
+            "username=Tester_1&serverId=-7c9d&ip=203.0.113.9"
+        );
     }
 }

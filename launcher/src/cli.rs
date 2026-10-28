@@ -90,8 +90,18 @@ enum AccountCmd {
     /// The signed-in accounts and which one plays
     List,
     /// Sign in with a Microsoft account in your browser (device code). Play needs one that owns
-    /// Minecraft: Java Edition
-    SignIn,
+    /// Minecraft: Java Edition. With --ely, an ely.by username and password instead
+    SignIn {
+        /// Sign in with an ely.by account instead of Microsoft
+        #[arg(long)]
+        ely: bool,
+        /// ely.by e-mail or username (with --ely)
+        #[arg(long)]
+        username: Option<String>,
+        /// ely.by password (with --ely), or a 2FA code appended: "password:code"
+        #[arg(long)]
+        password: Option<String>,
+    },
     /// Sign out: the account's tokens leave the keychain
     SignOut {
         /// Its name or UUID
@@ -1417,6 +1427,7 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
                 json(serde_json::json!({
                     "accounts": accounts.accounts.iter().map(|a| serde_json::json!({
                         "name": a.name, "uuid": a.uuid,
+                        "kind": match a.kind { account::AccountKind::Elyby => "elyby", account::AccountKind::Microsoft => "msa" },
                         "selected": accounts.selected.as_ref() == Some(&a.uuid),
                     })).collect::<Vec<_>>(),
                     "offline": accounts.offline.iter().map(|n| serde_json::json!({
@@ -1438,7 +1449,11 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
                     } else {
                         " "
                     };
-                    println!("{mark} {}  {}", a.name, a.uuid);
+                    let kind = match a.kind {
+                        account::AccountKind::Elyby => "ely.by",
+                        account::AccountKind::Microsoft => "microsoft",
+                    };
+                    println!("{mark} {}  {}  ({kind})", a.name, a.uuid);
                 }
                 for n in &accounts.offline {
                     let on = accounts.player() == account::Player::Offline(n.clone());
@@ -1454,25 +1469,69 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
                 }
             }
         }
-        AccountCmd::SignIn => {
-            let client_id = account::client_id().ok_or(account::NOT_CONFIGURED)?;
-            let ep = account::Endpoints::live();
-            let code = account::device_code(&ep, &client_id)?;
-            eprintln!(
-                "To sign in, open {} in a browser and enter the code {}",
-                code.verification_uri, code.user_code
-            );
-            let ms = account::wait_for_sign_in(&ep, &client_id, &code, &|| false)?;
-            let (signed_in, secrets) = account::finish_sign_in(&ep, ms)?;
-            accounts.add(account::store(), signed_in.clone(), &secrets)?;
-            accounts.save()?;
-            println!("Signed in as {}.", signed_in.name);
-            if !account::store().persistent() {
-                eprintln!("{}", account::NO_KEYCHAIN);
+        AccountCmd::SignIn {
+            ely,
+            username,
+            password,
+        } => {
+            if ely {
+                let username = username.ok_or("You must pass --username for an ely.by sign-in.")?;
+                let password = password.ok_or("You must pass --password for an ely.by sign-in.")?;
+                let client_token =
+                    std::env::var(horizon_launcher::account::elyby::CLIENT_TOKEN_ENV)
+                        .unwrap_or_else(|_| {
+                            // A steady client token, stored next to accounts.json.
+                            let path =
+                                horizon_launcher::backend::data_dir().join("ely-client-token");
+                            if let Ok(t) = std::fs::read_to_string(&path) {
+                                let t = t.trim().to_owned();
+                                if !t.is_empty() {
+                                    return t;
+                                }
+                            }
+                            let mut bytes = [0u8; 16];
+                            let _ = getrandom::fill(&mut bytes);
+                            let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                            let _ = std::fs::write(&path, &token);
+                            token
+                        });
+                let (signed_in, secrets) = horizon_launcher::account::elyby::authenticate(
+                    &username,
+                    &password,
+                    None,
+                    &client_token,
+                )?;
+                accounts.add(account::store(), signed_in.clone(), &secrets)?;
+                accounts.save()?;
+                println!("Signed in as {}.", signed_in.name);
+                if !account::store().persistent() {
+                    eprintln!("{}", account::NO_KEYCHAIN);
+                }
+            } else {
+                let client_id = account::client_id().ok_or(account::NOT_CONFIGURED)?;
+                let ep = account::Endpoints::live();
+                let code = account::device_code(&ep, &client_id)?;
+                eprintln!(
+                    "To sign in, open {} in a browser and enter the code {}",
+                    code.verification_uri, code.user_code
+                );
+                let ms = account::wait_for_sign_in(&ep, &client_id, &code, &|| false)?;
+                let (signed_in, secrets) = account::finish_sign_in(&ep, ms)?;
+                accounts.add(account::store(), signed_in.clone(), &secrets)?;
+                accounts.save()?;
+                println!("Signed in as {}.", signed_in.name);
+                if !account::store().persistent() {
+                    eprintln!("{}", account::NO_KEYCHAIN);
+                }
             }
         }
         AccountCmd::SignOut { who } => {
             let a = find(&accounts, &who)?;
+            if a.kind == account::AccountKind::Elyby {
+                if let Some(secrets) = account::secrets_in(account::store(), &a.uuid) {
+                    horizon_launcher::account::elyby::invalidate(&secrets);
+                }
+            }
             accounts.remove(account::store(), &a.uuid)?;
             accounts.save()?;
             println!("Signed out {}.", a.name);

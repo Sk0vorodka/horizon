@@ -233,6 +233,24 @@ struct Launcher {
     proxy_input: String,
     proxy_focused: bool,
     proxy_focus: FocusHandle,
+    /// The ely.by sign-in's fields (Settings' Accounts): the e-mail or username, the password,
+    /// the two-factor code when the account needs one, and the sign-in in flight.
+    ely_user: String,
+    ely_user_focused: bool,
+    ely_user_focus: FocusHandle,
+    ely_pass: String,
+    ely_pass_focused: bool,
+    ely_pass_focus: FocusHandle,
+    ely_totp: String,
+    ely_totp_focused: bool,
+    ely_totp_focus: FocusHandle,
+    ely_sign_in: Option<horizon_launcher::account::elyby::SignIn>,
+    ely_sign_in_state: Option<horizon_launcher::account::elyby::Step>,
+    /// Whether the ely.by sign-in form is shown.
+    ely_form_open: bool,
+    /// The launcher's ely.by client token (one per install).
+    ely_client_token: String,
+
     /// Opt-in data collection: the player's answer and Settings' section (`collection`).
     collection: collection::Collection,
     /// Settings' "Connect an AI agent" (`agents_page`).
@@ -290,6 +308,29 @@ struct Launcher {
     scale: f32,
 }
 
+/// The launcher's ely.by client token: one per install, kept in `data_dir/ely-client-token`
+/// (the Yggdrasil protocol wants a steady token across sign-ins), overridable for tests.
+fn ely_client_token() -> String {
+    use horizon_launcher::account::elyby::CLIENT_TOKEN_ENV;
+    if let Ok(t) = std::env::var(CLIENT_TOKEN_ENV) {
+        let t = t.trim().to_owned();
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    let path = horizon_launcher::backend::data_dir().join("ely-client-token");
+    if let Ok(t) = std::fs::read_to_string(&path) {
+        let t = t.trim().to_owned();
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    let mut bytes = [0u8; 16];
+    let _ = getrandom::fill(&mut bytes);
+    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let _ = std::fs::write(&path, &token);
+    token
+}
 impl Launcher {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (tx, rx) = channel();
@@ -400,6 +441,19 @@ impl Launcher {
             proxy_input: settings.proxy.clone().unwrap_or_default(),
             proxy_focused: false,
             proxy_focus: cx.focus_handle(),
+            ely_user: String::new(),
+            ely_user_focused: false,
+            ely_user_focus: cx.focus_handle(),
+            ely_pass: String::new(),
+            ely_pass_focused: false,
+            ely_pass_focus: cx.focus_handle(),
+            ely_totp: String::new(),
+            ely_totp_focused: false,
+            ely_totp_focus: cx.focus_handle(),
+            ely_sign_in: None,
+            ely_sign_in_state: None,
+            ely_form_open: false,
+            ely_client_token: ely_client_token(),
             settings,
             links: backend::Links::default(),
             preparing: false,
@@ -930,6 +984,29 @@ impl Launcher {
                     }
                 }
                 self.sign_in_state = Some(state);
+                changed = true;
+            }
+        }
+        if let Some(sign_in) = &self.ely_sign_in {
+            let state = sign_in.state();
+            let changed_state = format!("{state:?}") != format!("{:?}", self.ely_sign_in_state);
+            if changed_state {
+                if let horizon_launcher::account::elyby::Step::Done(Ok((account, secrets))) = &state
+                {
+                    let account = account.clone();
+                    let secrets = secrets.clone();
+                    let mut accounts = Accounts::load();
+                    if let Err(e) = accounts.add(account::store(), account.clone(), &secrets) {
+                        self.ely_sign_in_state =
+                            Some(horizon_launcher::account::elyby::Step::Done(Err(e)));
+                    } else {
+                        let _ = accounts.save();
+                        self.accounts = accounts;
+                        self.owner = Some(self.accounts.has_owner(account::store()));
+                        self.ely_form_open = false;
+                    }
+                }
+                self.ely_sign_in_state = Some(state);
                 changed = true;
             }
         }
@@ -3242,6 +3319,12 @@ impl Launcher {
                 button(format!("sign-out-{i}"), "Sign out", Kind::Ghost, &t).on_click(cx.listener(
                     move |this, _: &ClickEvent, _, cx| {
                         let store = account::store();
+                        // An ely.by token leaves ely.by's store too (best effort).
+                        if a.kind == account::AccountKind::Elyby {
+                            if let Some(secrets) = account::secrets_in(store, &uuid) {
+                                horizon_launcher::account::elyby::invalidate(&secrets);
+                            }
+                        }
                         if let Err(e) = this.accounts.remove(store, &uuid) {
                             this.sign_in_state = Some(SignInState::Done(Err(e)));
                         }
@@ -3252,18 +3335,16 @@ impl Launcher {
                 )),
             );
             n += 1;
+            let key = match (a.kind, plays) {
+                (account::AccountKind::Elyby, true) => "Ely.by account · plays",
+                (account::AccountKind::Elyby, false) => "Ely.by account · signed in",
+                (_, true) => "Microsoft account · plays",
+                (_, false) => "Microsoft account · signed in",
+            };
             rows = rows.child(index_row(
                 n,
                 a.name.clone(),
-                Some(
-                    div()
-                        .child(tr(if plays {
-                            "Microsoft account · plays"
-                        } else {
-                            "Microsoft account · signed in"
-                        }))
-                        .into_any_element(),
-                ),
+                Some(div().child(tr(key)).into_any_element()),
                 Some(actions.into_any_element()),
                 &t,
             ));
@@ -3367,7 +3448,228 @@ impl Launcher {
             action,
             &t,
         ));
+        n += 1;
+        rows = rows.child(self.elyby_row(n, cx));
         (rows, n)
+    }
+
+    /// Settings' Accounts: the ely.by sign-in. Ely.by is an alternative account service
+    /// (docs.ely.by): a login and a password, no browser code; a two-factor account asks
+    /// for one more field.
+    fn elyby_row(&mut self, n: usize, cx: &mut Context<Self>) -> Div {
+        let t = self.theme;
+        let busy = matches!(
+            self.ely_sign_in_state,
+            Some(horizon_launcher::account::elyby::Step::Starting)
+        );
+        let totp_needed = matches!(
+            self.ely_sign_in_state,
+            Some(horizon_launcher::account::elyby::Step::Totp)
+        );
+        let mut actions = div().flex().flex_col().gap(px(6.));
+        if self.ely_form_open {
+            let user = self.input_field(
+                "ely-user",
+                &self.ely_user_focus,
+                self.ely_user_focused,
+                &self.ely_user,
+                "E-mail or username",
+                |this| &mut this.ely_user,
+                |this| &this.ely_user_focus,
+                |this, f| this.ely_user_focused = f,
+                cx,
+            );
+            actions = actions.child(user);
+            let pass = self.input_field(
+                "ely-pass",
+                &self.ely_pass_focus,
+                self.ely_pass_focused,
+                &self.ely_pass,
+                "Password",
+                |this| &mut this.ely_pass,
+                |this| &this.ely_pass_focus,
+                |this, f| this.ely_pass_focused = f,
+                cx,
+            );
+            actions = actions.child(pass);
+            if totp_needed {
+                let code = self.input_field(
+                    "ely-totp",
+                    &self.ely_totp_focus,
+                    self.ely_totp_focused,
+                    &self.ely_totp,
+                    "6-digit code",
+                    |this| &mut this.ely_totp,
+                    |this| &this.ely_totp_focus,
+                    |this, f| this.ely_totp_focused = f,
+                    cx,
+                );
+                actions = actions.child(code);
+            }
+            let sign_in = button(
+                "ely-sign-in",
+                if busy {
+                    "Signing in…"
+                } else if totp_needed {
+                    "Verify code"
+                } else {
+                    "Sign in with Ely.by"
+                },
+                Kind::Secondary,
+                &t,
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                // A sign-in in flight isn't re-triggered by clicking again.
+                if matches!(
+                    this.ely_sign_in_state,
+                    Some(horizon_launcher::account::elyby::Step::Starting)
+                ) {
+                    return;
+                }
+                let username = this.ely_user.trim().to_owned();
+                if username.is_empty() {
+                    this.ely_sign_in_state = Some(horizon_launcher::account::elyby::Step::Done(
+                        Err("Enter your ely.by e-mail or username.".into()),
+                    ));
+                    cx.notify();
+                    return;
+                }
+                let password = this.ely_pass.clone();
+                let client_token = this.ely_client_token.clone();
+                let totp =
+                    this.ely_sign_in_state == Some(horizon_launcher::account::elyby::Step::Totp);
+                if totp {
+                    let code = this.ely_totp.clone();
+                    if let Some(s) = &this.ely_sign_in {
+                        s.submit_totp(code, client_token);
+                    }
+                } else {
+                    this.ely_sign_in = Some(horizon_launcher::account::elyby::SignIn::start(
+                        username,
+                        password,
+                        client_token,
+                    ));
+                    this.ely_sign_in_state = Some(horizon_launcher::account::elyby::Step::Starting);
+                }
+                cx.notify();
+            }));
+            let register = button("ely-register", "Create an account", Kind::Ghost, &t).on_click(
+                move |_, _, cx| cx.open_url(horizon_launcher::account::elyby::REGISTER_URL),
+            );
+            actions = actions.child(div().flex().gap(px(4.)).child(sign_in).child(register));
+        } else {
+            actions = actions.child(
+                button("ely-open", "Sign in with Ely.by", Kind::Ghost, &t).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        this.ely_form_open = true;
+                        this.ely_sign_in_state = None;
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+        if let Some(horizon_launcher::account::elyby::Step::Done(Err(e))) = &self.ely_sign_in_state
+        {
+            actions = actions.child(div().text_color(t.danger).child(e.clone()));
+        } else if self.ely_sign_in_state.is_some() || self.ely_form_open {
+            actions = actions.child(div().text_color(t.muted).child(tr(
+                "Ely.by signs you in with your e-mail and password; a two-factor account asks for a 6-digit code. Accounts are made at ely.by.",
+            )));
+        }
+        let detail = div()
+            .child(tr(
+                "Ely.by is an alternative account service: the same game, your ely.by profile.",
+            ))
+            .into_any_element();
+        index_row(
+            n,
+            "Ely.by",
+            Some(detail),
+            Some(actions.into_any_element()),
+            &t,
+        )
+    }
+
+    /// A one-line input, the proxy field's pattern: a focusable box that types into the
+    /// field `get` returns (and `set_focus` marks as focused).
+    fn input_field<F, H, G>(
+        &self,
+        id: &'static str,
+        _focus: &FocusHandle,
+        focused: bool,
+        value: &str,
+        placeholder: &str,
+        get: F,
+        get_focus: H,
+        set_focus: G,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div>
+    where
+        F: Fn(&mut Launcher) -> &mut String + 'static,
+        H: Fn(&Launcher) -> &FocusHandle + 'static,
+        G: Fn(&mut Launcher, bool) + 'static,
+    {
+        let t = self.theme;
+        let placeholder_text = placeholder.to_owned();
+        let value_text = value.to_owned();
+        let field = div()
+            .id(id)
+            .track_focus(get_focus(self))
+            .flex()
+            .items_center()
+            .w(px(280.))
+            .h(px(30.))
+            .px(px(12.))
+            .overflow_hidden()
+            .border_2()
+            .border_color(if focused { t.accent } else { t.outline })
+            .bg(t.well)
+            .font_family(theme::MONO)
+            .text_size(px(12.))
+            .cursor_text()
+            .child(if value.is_empty() && !focused {
+                div().text_color(t.muted).child(placeholder_text.clone())
+            } else {
+                div().text_color(t.ink).child(value_text.clone())
+            })
+            .child(div().w(px(1.)).h(px(14.)).bg(t.ink))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                window.focus(get_focus(this));
+                set_focus(this, true);
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
+                let k = &ev.keystroke;
+                let paste = k.key == "v" && (k.modifiers.control || k.modifiers.platform);
+                let value = get(this);
+                match k.key.as_str() {
+                    "backspace" => {
+                        value.pop();
+                    }
+                    _ if paste => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                            let line = text.lines().next().unwrap_or(&text);
+                            value.push_str(line.trim());
+                        }
+                    }
+                    _ if !k.modifiers.control && !k.modifiers.platform => {
+                        if let Some(ch) = &k.key_char {
+                            value.push_str(ch);
+                        }
+                    }
+                    _ => return,
+                }
+                if value.chars().count() > 256 {
+                    let cut = value
+                        .char_indices()
+                        .nth(256)
+                        .map_or(value.len(), |(i, _)| i);
+                    value.truncate(cut);
+                }
+                cx.stop_propagation();
+                cx.notify();
+            }));
+        field
     }
 
     /// Join a friend: a code field and Join, which starts the game straight

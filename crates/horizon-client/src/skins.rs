@@ -99,7 +99,11 @@ pub fn unpack(value: &str, signature: Signature, valid_uris: &[&str]) -> Texture
         };
         let allowed = valid_uris
             .iter()
-            .any(|u| url.starts_with(&u.replace("{textureId}", "")));
+            .any(|u| url.starts_with(&u.replace("{textureId}", "")))
+            // Ely.by skins live on skins.ely.by (the authserver's skinDomains);
+            // their texture payloads name http://skins.ely.by/… URLs.
+            || url.starts_with("http://skins.ely.by/")
+            || url.starts_with("https://skins.ely.by/");
         if !allowed {
             return empty;
         }
@@ -832,6 +836,22 @@ mod tests {
         );
         assert!(t.slim);
         assert!(!unpack(wide, Signature::Signed, &TEXTURE_URIS).slim);
+    }
+    #[test]
+    fn elyby_skin_urls_unpack() {
+        use super::{Signature, TEXTURE_URIS, unpack};
+        // An ely.by textures payload: skins live on skins.ely.by, signed by
+        // ely.by's own key (docs.ely.by, skins system).
+        let value = "eyJ0ZXh0dXJlcyI6eyJTS0lOIjp7InVybCI6Imh0dHA6Ly9za2lucy5lbHkuYnkvc2tpbnMvYWJjLnBuZyJ9fX0=";
+        let t = unpack(value, Signature::Signed, &TEXTURE_URIS);
+        assert_eq!(t.skin.as_deref(), Some("http://skins.ely.by/skins/abc.png"));
+        // A URL outside both services' domains stays refused.
+        let outsider =
+            "eyJ0ZXh0dXJlcyI6eyJTS0lOIjp7InVybCI6Imh0dHA6Ly9ldmlsLmV4YW1wbGUvYS5wbmcifX19";
+        assert_eq!(
+            unpack(outsider, Signature::Signed, &TEXTURE_URIS).skin,
+            None
+        );
     }
     #[test]
     fn profiles_parse_like_resolvable_profiles() {
