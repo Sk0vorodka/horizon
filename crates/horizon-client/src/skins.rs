@@ -29,6 +29,10 @@ pub const TEXTURE_URIS: [&str; 2] = [
     "https://textures.minecraft.net/texture/{textureId}",
     "http://textures.minecraft.net/texture/{textureId}",
 ];
+/// Ely.by's authlib-injector profile endpoint (`/api/profiles/minecraft/<name>`):
+/// a player registered through ely.by has `properties` there (its `textures`
+/// names a `skins.ely.by` URL), so a skin shows whoever the launcher was.
+pub const ELYBY_PROFILE: &str = "https://authserver.ely.by/api/profiles/minecraft/";
 
 /// `java.util.Base64.getDecoder().decode`.
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
@@ -237,6 +241,34 @@ fn valid_player_name(name: &str) -> bool {
     name.encode_utf16().count() <= 16 && name.encode_utf16().all(|c| c > 32 && c < 127)
 }
 
+/// An ely.by player's profile, by name (authlib-injector's
+/// `GET /api/profiles/minecraft/<name>`). `None` when ely.by has no such
+/// player, or is unreachable: the caller keeps whatever it already has.
+fn elyby_profile(name: &str) -> Option<ResolvedProfile> {
+    let url = format!("{ELYBY_PROFILE}{}", name.to_lowercase());
+    let body = http_get(&url)?;
+    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    Some(ResolvedProfile {
+        id: crate::auth::parse_uuid(v.get("id")?.as_str()?)?,
+        name: v.get("name")?.as_str()?.to_owned(),
+        properties: v
+            .get("properties")?
+            .as_array()?
+            .iter()
+            .map(|p| {
+                Some((
+                    p.get("name")?.as_str()?.to_owned(),
+                    p.get("value")?.as_str()?.to_owned(),
+                    p.get("signature")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_owned),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?,
+    })
+}
+
+
 /// `fetchByNameOrId`: `getByName` answers `{id, name}`; `getProfileById`
 /// (`fetchProfile(id, requireSecure)`) answers `{id, name, properties}` —
 /// asked `unsigned=false` so the `textures` property is signed.
@@ -256,23 +288,33 @@ fn resolve_profile(key: &NameOrId, doc: &serde_json::Value) -> Option<ResolvedPr
     let separator = if url.contains('?') { '&' } else { '?' };
     let body = http_get(&format!("{url}{separator}unsigned=false"))?;
     let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    let name = v.get("name")?.as_str()?.to_owned();
+    let properties: Vec<(String, String, Option<String>)> = v
+        .get("properties")?
+        .as_array()?
+        .iter()
+        .map(|p| {
+            Some((
+                p.get("name")?.as_str()?.to_owned(),
+                p.get("value")?.as_str()?.to_owned(),
+                p.get("signature")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_owned),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    // Mojang sold no textures (the player is not a Mojang account): ask
+    // ely.by, whose players' skins live on `skins.ely.by` (authlib-injector's
+    // profile endpoint). This is how ely.by skins show whoever the launcher was.
+    if !properties.iter().any(|(n, _, _)| n == "textures") {
+        if let Some(ely) = elyby_profile(&name) {
+            return Some(ely);
+        }
+    }
     Some(ResolvedProfile {
         id: crate::auth::parse_uuid(v.get("id")?.as_str()?)?,
-        name: v.get("name")?.as_str()?.to_owned(),
-        properties: v
-            .get("properties")?
-            .as_array()?
-            .iter()
-            .map(|p| {
-                Some((
-                    p.get("name")?.as_str()?.to_owned(),
-                    p.get("value")?.as_str()?.to_owned(),
-                    p.get("signature")
-                        .and_then(|s| s.as_str())
-                        .map(str::to_owned),
-                ))
-            })
-            .collect::<Option<Vec<_>>>()?,
+        name,
+        properties,
     })
 }
 
