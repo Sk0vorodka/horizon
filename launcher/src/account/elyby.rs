@@ -439,12 +439,19 @@ impl SignIn {
     }
 }
 
-/// The environment variables the OAuth sign-in reads.
+/// The environment variables the OAuth sign-in reads (falling back to the
+/// built-in application's credentials).
 pub const OAUTH_CLIENT_ID_ENV: &str = "HORIZON_ELYBY_OAUTH_CLIENT_ID";
 pub const OAUTH_CLIENT_SECRET_ENV: &str = "HORIZON_ELYBY_OAUTH_CLIENT_SECRET";
 pub const OAUTH_REDIRECT_URI_ENV: &str = "HORIZON_ELYBY_OAUTH_REDIRECT_URI";
 
-/// The default callback address the launcher listens on (register it as the
+/// The Horizon launcher's ely.by OAuth application (registered at
+/// account.ely.by/dev/applications). Desktop applications ship their client
+/// secret with the binary; it is not a password.
+pub const OAUTH_CLIENT_ID_DEFAULT: &str = "elyhorizon1";
+pub const OAUTH_CLIENT_SECRET_DEFAULT: &str =
+    "7EIUUg-7-n6HHLCCO9dCXMc09h2LN8nSk4DqanS1Q_2wkHYwKQ41ANSTSS35mzmb";
+/// The default callback address the launcher listens on (registered as the
 /// application's redirect URI).
 pub const OAUTH_DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:45678/oauth";
 
@@ -460,9 +467,9 @@ impl SignIn {
             let set = |s| *thread_state.lock().unwrap() = s;
             let result = (|| -> Result<(Account, Secrets), String> {
                 let client_id = std::env::var(OAUTH_CLIENT_ID_ENV)
-                    .map_err(|_| format!("Set {OAUTH_CLIENT_ID_ENV} to your ely.by OAuth application's client id."))?;
+                    .unwrap_or_else(|_| OAUTH_CLIENT_ID_DEFAULT.to_owned());
                 let client_secret = std::env::var(OAUTH_CLIENT_SECRET_ENV)
-                    .map_err(|_| format!("Set {OAUTH_CLIENT_SECRET_ENV} to your ely.by OAuth application's client secret."))?;
+                    .unwrap_or_else(|_| OAUTH_CLIENT_SECRET_DEFAULT.to_owned());
                 let redirect_uri = std::env::var(OAUTH_REDIRECT_URI_ENV)
                     .unwrap_or_else(|_| OAUTH_DEFAULT_REDIRECT_URI.to_owned());
                 let port = redirect_uri

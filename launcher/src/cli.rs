@@ -1482,12 +1482,17 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
             password,
         } => {
             if ely_oauth {
-                let client_id = std::env::var("HORIZON_ELYBY_OAUTH_CLIENT_ID")
-                    .map_err(|_| "Set HORIZON_ELYBY_OAUTH_CLIENT_ID to your ely.by OAuth application's client id.")?;
-                let client_secret = std::env::var("HORIZON_ELYBY_OAUTH_CLIENT_SECRET")
-                    .map_err(|_| "Set HORIZON_ELYBY_OAUTH_CLIENT_SECRET to your ely.by OAuth application's client secret.")?;
-                let redirect_uri = std::env::var("HORIZON_ELYBY_OAUTH_REDIRECT_URI")
-                    .unwrap_or_else(|_| "http://127.0.0.1:45678/oauth".into());
+                use horizon_launcher::account::elyby::{
+                    OAUTH_CLIENT_ID_DEFAULT, OAUTH_CLIENT_SECRET_DEFAULT,
+                    OAUTH_CLIENT_ID_ENV, OAUTH_CLIENT_SECRET_ENV, OAUTH_REDIRECT_URI_ENV,
+                    OAUTH_DEFAULT_REDIRECT_URI,
+                };
+                let client_id = std::env::var(OAUTH_CLIENT_ID_ENV)
+                    .unwrap_or_else(|_| OAUTH_CLIENT_ID_DEFAULT.to_owned());
+                let client_secret = std::env::var(OAUTH_CLIENT_SECRET_ENV)
+                    .unwrap_or_else(|_| OAUTH_CLIENT_SECRET_DEFAULT.to_owned());
+                let redirect_uri = std::env::var(OAUTH_REDIRECT_URI_ENV)
+                    .unwrap_or_else(|_| OAUTH_DEFAULT_REDIRECT_URI.to_owned());
                 let port = redirect_uri
                     .rsplit(':')
                     .next()
