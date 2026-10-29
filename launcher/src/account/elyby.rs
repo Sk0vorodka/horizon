@@ -439,6 +439,70 @@ impl SignIn {
     }
 }
 
+/// The environment variables the OAuth sign-in reads.
+pub const OAUTH_CLIENT_ID_ENV: &str = "HORIZON_ELYBY_OAUTH_CLIENT_ID";
+pub const OAUTH_CLIENT_SECRET_ENV: &str = "HORIZON_ELYBY_OAUTH_CLIENT_SECRET";
+pub const OAUTH_REDIRECT_URI_ENV: &str = "HORIZON_ELYBY_OAUTH_REDIRECT_URI";
+
+/// The default callback address the launcher listens on (register it as the
+/// application's redirect URI).
+pub const OAUTH_DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:45678/oauth";
+
+impl SignIn {
+    /// The full OAuth flow on a background thread: open the browser, listen
+    /// for the callback, exchange the code, read the account and the skin.
+    /// The state goes Starting → Done like the password sign-in, so the
+    /// window's existing handler adds the account.
+    pub fn start_oauth() -> Self {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(Step::Starting));
+        let thread_state = state.clone();
+        std::thread::spawn(move || {
+            let set = |s| *thread_state.lock().unwrap() = s;
+            let result = (|| -> Result<(Account, Secrets), String> {
+                let client_id = std::env::var(OAUTH_CLIENT_ID_ENV)
+                    .map_err(|_| format!("Set {OAUTH_CLIENT_ID_ENV} to your ely.by OAuth application's client id."))?;
+                let client_secret = std::env::var(OAUTH_CLIENT_SECRET_ENV)
+                    .map_err(|_| format!("Set {OAUTH_CLIENT_SECRET_ENV} to your ely.by OAuth application's client secret."))?;
+                let redirect_uri = std::env::var(OAUTH_REDIRECT_URI_ENV)
+                    .unwrap_or_else(|_| OAUTH_DEFAULT_REDIRECT_URI.to_owned());
+                let port = redirect_uri
+                    .rsplit(':')
+                    .next()
+                    .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+                    .unwrap_or(45678);
+                let state_token = format!("{:016x}", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0));
+                let url = oauth_authorize_url(&client_id, &redirect_uri, &state_token);
+                open_browser(&url)?;
+                let (code, returned_state) = listen_for_code(port)?;
+                if returned_state != state_token {
+                    return Err("The OAuth state did not match; try again.".into());
+                }
+                let (access, refresh, expires) =
+                    oauth_exchange(&client_id, &client_secret, &redirect_uri, &code)?;
+                let (uuid, name) = oauth_account_info(&access)?;
+                let account = Account {
+                    uuid: uuid.replace('-', "").to_lowercase(),
+                    name: name.clone(),
+                    skin: skin_for(&name),
+                    cape: None,
+                    kind: AccountKind::Elyby,
+                };
+                let secrets = Secrets::elyby_oauth(access, refresh, expires);
+                Ok((account, secrets))
+            })();
+            set(Step::Done(result));
+        });
+        Self {
+            state,
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

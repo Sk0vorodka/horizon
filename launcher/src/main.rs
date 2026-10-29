@@ -3553,10 +3553,28 @@ impl Launcher {
                 }
                 cx.notify();
             }));
+            let oauth = button(
+                "ely-oauth",
+                "Sign in with browser",
+                Kind::Ghost,
+                &t,
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                if matches!(
+                    this.ely_sign_in_state,
+                    Some(horizon_launcher::account::elyby::Step::Starting)
+                ) {
+                    return;
+                }
+                this.ely_sign_in = Some(horizon_launcher::account::elyby::SignIn::start_oauth());
+                this.ely_sign_in_state = Some(horizon_launcher::account::elyby::Step::Starting);
+                cx.notify();
+            }));
             let register = button("ely-register", "Create an account", Kind::Ghost, &t).on_click(
                 move |_, _, cx| cx.open_url(horizon_launcher::account::elyby::REGISTER_URL),
             );
-            actions = actions.child(div().flex().gap(px(4.)).child(sign_in).child(register));
+            actions = actions
+                .child(div().flex().gap(px(4.)).child(sign_in).child(oauth).child(register));
         } else {
             actions = actions.child(
                 button("ely-open", "Sign in with Ely.by", Kind::Ghost, &t).on_click(cx.listener(
