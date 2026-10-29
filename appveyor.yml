@@ -6,6 +6,7 @@ test: off
 cache:
   - '%USERPROFILE%\.cargo\registry -> appveyor.yml'
   - launcher\target -> appveyor.yml
+  - target -> appveyor.yml
 
 environment:
   matrix:
@@ -19,8 +20,10 @@ install:
 build_script:
   - set PATH=%USERPROFILE%\.cargo\bin;%PATH%
   - rustup default stable
-  - if "%JOB%"=="launcher" (cargo build --release --manifest-path launcher/Cargo.toml) else (cargo check -p horizon-client --lib)
+  - if "%JOB%"=="launcher" (cargo build --release --manifest-path launcher/Cargo.toml) else (cargo build --release -p horizon-client)
 
 artifacts:
   - path: launcher\target\release\horizon-launcher.exe
     name: horizon-launcher-windows
+  - path: target\release\horizon-client.exe
+    name: horizon-client-windows
