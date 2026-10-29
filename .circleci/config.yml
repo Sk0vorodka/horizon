@@ -23,8 +23,31 @@ jobs:
           path: launcher/target/release/horizon-launcher.exe
           destination: horizon-launcher-windows.exe
 
+  client-windows:
+    machine:
+      image: windows-default-2022
+    steps:
+      - checkout
+      - run:
+          name: Install Rust
+          command: |
+            curl -sSf -o rustup-init.exe https://win.rustup.rs/x86_64
+            ./rustup-init.exe -y --profile minimal --default-toolchain stable
+            $env:Path = "$env:USERPROFILE\.cargo\bin;" + $env:Path
+            rustup default stable
+      - run:
+          name: Build client (release)
+          command: |
+            $env:Path = "$env:USERPROFILE\.cargo\bin;" + $env:Path
+            cargo build --release -p horizon-client
+            Get-ChildItem target/release -Filter "horizon-*" | Select-Object FullName,Length
+      - store_artifacts:
+          path: target/release/horizon-client.exe
+          destination: horizon-client-windows.exe
+
 workflows:
   version: 2
   build:
     jobs:
       - launcher-windows
+      - client-windows

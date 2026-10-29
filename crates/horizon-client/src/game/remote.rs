@@ -3098,6 +3098,15 @@ impl Game<'_> {
         let Resolve::Done(Some(profile)) = state else {
             return None;
         };
+        // An ely.by account has no Mojang textures; its skin lives on ely.by
+        // (`skins.ely.by`), and ely.by's profile endpoint answers by name.
+        // Pull it so the local player is not a default Steve.
+        if profile.textures().is_none() && auth.kind == horizon_client::auth::AccountKind::Elyby {
+            if let Some(ely) = skins::elyby_profile(&profile.name) {
+                let (value, signature) = ely.textures()?;
+                return Some(skins::unpack(&value, signature, &skins::TEXTURE_URIS));
+            }
+        }
         let (value, signature) = profile.textures()?;
         Some(skins::unpack(&value, signature, &skins::TEXTURE_URIS))
     }

@@ -244,7 +244,7 @@ fn valid_player_name(name: &str) -> bool {
 /// An ely.by player's profile, by name (authlib-injector's
 /// `GET /api/profiles/minecraft/<name>`). `None` when ely.by has no such
 /// player, or is unreachable: the caller keeps whatever it already has.
-fn elyby_profile(name: &str) -> Option<ResolvedProfile> {
+pub(crate) fn elyby_profile(name: &str) -> Option<ResolvedProfile> {
     let url = format!("{ELYBY_PROFILE}{}", name.to_lowercase());
     let body = http_get(&url)?;
     let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
