@@ -3091,6 +3091,15 @@ impl Game<'_> {
     fn own_textures(&self) -> Option<horizon_client::skins::Textures> {
         use horizon_client::skins::{self, NameOrId, Resolve};
         let auth = horizon_client::auth::current()?;
+        // The launcher's session file carries the skin for accounts it signed in
+        // with (ely.by): use it as-is, no network.
+        if let Some((url, model)) = &auth.skin {
+            return Some(horizon_client::skins::Textures {
+                skin: Some(url.clone()),
+                slim: model == "slim",
+                ..Default::default()
+            });
+        }
         let state = self
             .skin_profiles
             .borrow_mut()

@@ -1179,12 +1179,19 @@ pub fn write_session_file(
         AccountKind::Elyby => "elyby",
         AccountKind::Microsoft => "msa",
     };
+    let (skin_url, skin_model) = account
+        .skin
+        .as_ref()
+        .map(|(url, model)| (Some(url.as_str()), Some(model.as_str())))
+        .unwrap_or((None, None));
     let body = json!({
         "name": account.name,
         "uuid": account.uuid,
         "access_token": secrets.minecraft_token,
         "user_type": user_type,
         "xuid": secrets.xuid,
+        "skin_url": skin_url,
+        "skin_model": skin_model,
     });
     std::io::Write::write_all(&mut file, body.to_string().as_bytes()).map_err(|e| e.to_string())?;
     Ok(path)

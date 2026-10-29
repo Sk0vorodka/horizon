@@ -48,6 +48,11 @@ pub struct AuthSession {
     pub uuid: u128,
     pub xuid: Option<String>,
     pub kind: AccountKind,
+    /// The skin the launcher signed in with: `(url, model)` ("classic" or
+    /// "slim"). `None` when the launcher had none; the game then falls back
+    /// to resolving it from the services. For ely.by accounts this is what
+    /// makes the skin show without the game needing to reach ely.by.
+    pub skin: Option<(String, String)>,
     access_token: String,
 }
 impl std::fmt::Debug for AuthSession {
@@ -76,6 +81,7 @@ impl AuthSession {
             uuid,
             xuid: None,
             kind: AccountKind::Msa,
+            skin: None,
             access_token: access_token.to_owned(),
         }
     }
@@ -86,6 +92,7 @@ impl AuthSession {
             uuid,
             xuid: None,
             kind: AccountKind::Elyby,
+            skin: None,
             access_token: access_token.to_owned(),
         }
     }
@@ -111,6 +118,13 @@ impl AuthSession {
             uuid,
             xuid: field("xuid").map(str::to_owned),
             kind: AccountKind::from_user_type(field("user_type"))?,
+            skin: match (field("skin_url"), field("skin_model")) {
+                (Some(url), model) => {
+                    let model = model.unwrap_or("classic").to_owned();
+                    Some((url.to_owned(), model))
+                }
+                (None, _) => None,
+            },
             access_token: access_token.to_owned(),
         })
     }

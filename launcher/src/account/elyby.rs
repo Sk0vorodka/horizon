@@ -14,6 +14,7 @@
 use serde_json::{json, Value};
 use std::time::Duration;
 
+use base64::Engine;
 use super::{Account, AccountKind, Secrets};
 
 /// The ely.by authserver (the authlib-injector `ely.by` metadata's base).
@@ -88,8 +89,8 @@ fn response_profile(v: &Value) -> Result<(Account, Secrets), String> {
     Ok((
         Account {
             uuid: uuid.replace('-', "").to_lowercase(),
-            name,
-            skin: None,
+            name: name.clone(),
+            skin: skin_for(&name),
             cape: None,
             kind: AccountKind::Elyby,
         },
@@ -171,6 +172,35 @@ pub fn invalidate(secrets: &Secrets) {
             "clientToken": secrets.ely_client_token().unwrap_or_default(),
         }),
     );
+}
+
+/// The ely.by player's profile: its `textures` property names the skin on
+/// `skins.ely.by`. The launcher's own requests go through the player's proxy,
+/// so this works even where the game's own network can't reach ely.by; the
+/// game gets the skin URL in the session file and needs no network for it.
+pub fn skin_for(name: &str) -> Option<(String, String)> {
+    let url = format!("https://authserver.ely.by/api/profiles/minecraft/{name}");
+    let response = request_to("GET", &url).call().ok()?;
+    let v: Value = serde_json::from_str(&response.into_string().ok()?).ok()?;
+    let property = v.get("properties")?.as_array()?.iter().find(|p| {
+        p.get("name").and_then(Value::as_str) == Some("textures")
+    })?;
+    let value = property.get("value")?.as_str()?;
+    let decoded: Value =
+        serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(value).ok()?)
+            .ok()?;
+    let texture = decoded.get("textures")?.get("SKIN")?;
+    let url = texture.get("url")?.as_str()?.to_owned();
+    if !url.starts_with("http://skins.ely.by/") && !url.starts_with("https://skins.ely.by/") {
+        return None;
+    }
+    let model = texture
+        .get("metadata")
+        .and_then(|m| m.get("model"))
+        .and_then(Value::as_str)
+        .unwrap_or("classic")
+        .to_owned();
+    Some((url, model))
 }
 
 /// A sign-in on its own thread, from the fields to the saved account. The window shows
