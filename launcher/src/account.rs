@@ -522,6 +522,23 @@ impl Secrets {
             client_token: Some(client_token),
         }
     }
+    /// An ely.by OAuth session (account.ely.by): the access token is the
+    /// Minecraft session (`minecraft_server_session` scope), and the refresh
+    /// token renews it through the OAuth token endpoint.
+    pub fn elyby_oauth(access_token: String, refresh_token: String, expires_in: u64) -> Self {
+        Self {
+            refresh_token,
+            minecraft_token: access_token,
+            minecraft_expires_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+                + expires_in,
+            xuid: None,
+            owns: true,
+            client_token: None,
+        }
+    }
     /// The account's ely.by client token, if this is an ely.by account.
     pub fn ely_client_token(&self) -> Option<&str> {
         self.client_token.as_deref()

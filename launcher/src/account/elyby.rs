@@ -12,7 +12,10 @@
 //! do. The Mojang download of the game files still needs a Microsoft owner: the launcher never
 //! hands out Mojang's files itself.
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{
+    io::{Read, Write},
+    time::Duration,
+};
 
 use base64::Engine;
 use super::{Account, AccountKind, Secrets};
@@ -203,6 +206,196 @@ pub fn skin_for(name: &str) -> Option<(String, String)> {
     Some((url, model))
 }
 
+/// A percent-encoder for the OAuth query (letters, digits and `-._~` stay).
+fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for b in text.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// The page the user is sent to (account.ely.by/oauth2/v1). The launcher
+/// listens on `redirect_uri` for the callback with the code.
+pub fn oauth_authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> String {
+    format!(
+        "https://account.ely.by/oauth2/v1?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}",
+        percent_encode(client_id),
+        percent_encode(redirect_uri),
+        percent_encode("account_info offline_access minecraft_server_session"),
+        percent_encode(state),
+    )
+}
+
+/// Opens the system browser at `url`.
+pub fn open_browser(url: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .spawn()
+            .map_err(|e| format!("Could not open a browser: {e}"))?;
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("Could not open a browser: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Parses `?code=...&state=...` out of the first request the callback
+/// listener receives.
+fn parse_callback(path: &str) -> Option<(String, String)> {
+    let query = path.split_once('?')?.1;
+    let mut code = None;
+    let mut state = None;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=')?;
+        match k {
+            "code" => code = Some(v.to_owned()),
+            "state" => state = Some(v.to_owned()),
+            _ => {}
+        }
+    }
+    Some((code?, state?))
+}
+
+/// Listens on `127.0.0.1:<port>` for the OAuth callback, returns
+/// `(code, state)`.
+pub fn listen_for_code(port: u16) -> Result<(String, String), String> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("Could not listen on port {port}: {e}"))?;
+    let (mut stream, _) = listener
+        .accept()
+        .map_err(|e| format!("Could not accept the callback: {e}"))?;
+    let mut buf = [0u8; 8192];
+    let n = stream
+        .read(&mut buf)
+        .map_err(|e| format!("Could not read the callback: {e}"))?;
+    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let first = request.lines().next().unwrap_or_default();
+    let path = first.split_whitespace().nth(1).unwrap_or("/");
+    let body = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 56\r\nConnection: close\r\n\r\nYou can close this window now and return to Horizon.";
+    let _ = stream.write_all(body.as_bytes());
+    match parse_callback(path) {
+        Some(pair) => Ok(pair),
+        None => Err("The OAuth callback carried no code.".into()),
+    }
+}
+
+/// Exchanges the authorization code for an access token
+/// (`/api/oauth2/v1/token`, form-encoded).
+pub fn oauth_exchange(
+    client_id: &str,
+    client_secret: &str,
+    redirect_uri: &str,
+    code: &str,
+) -> Result<(String, String, u64), String> {
+    let url = "https://account.ely.by/api/oauth2/v1/token";
+    let form: Vec<(&str, &str)> = vec![
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+        ("redirect_uri", redirect_uri),
+        ("grant_type", "authorization_code"),
+        ("code", code),
+    ];
+    let response = match request_to("POST", url)
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .send_form(&form)
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(ureq::Error::Transport(_)) => {
+            return Err("Could not reach ely.by. Check your internet connection.".into())
+        }
+    };
+    let status = response.status();
+    let text = response.into_string().unwrap_or_default();
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if status >= 400 {
+        let why = str_field(&v, "error_description").unwrap_or_else(|| str_field(&v, "error").unwrap_or_default());
+        return Err(format!("ely.by refused the code: {why}"));
+    }
+    let access = str_field(&v, "access_token").ok_or("No access_token from ely.by")?;
+    let refresh = str_field(&v, "refresh_token").ok_or("No refresh_token from ely.by")?;
+    let expires = v
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(86400);
+    Ok((access, refresh, expires))
+}
+
+/// The account behind an OAuth access token (`/api/account/v1/info`).
+pub fn oauth_account_info(access_token: &str) -> Result<(String, String), String> {
+    let response = match request_to("GET", "https://account.ely.by/api/account/v1/info")
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .call()
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(ureq::Error::Transport(_)) => {
+            return Err("Could not reach ely.by. Check your internet connection.".into())
+        }
+    };
+    let status = response.status();
+    let text = response.into_string().unwrap_or_default();
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if status >= 400 {
+        return Err(format!("ely.by refused the token: {}", str_field(&v, "message").unwrap_or_default()));
+    }
+    let uuid = str_field(&v, "uuid").ok_or("No uuid from ely.by")?;
+    let name = str_field(&v, "username").ok_or("No username from ely.by")?;
+    Ok((uuid, name))
+}
+
+/// Refreshes an OAuth access token (`grant_type=refresh_token`).
+pub fn oauth_refresh(
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<(String, String, u64), String> {
+    let url = "https://account.ely.by/api/oauth2/v1/token";
+    let form: Vec<(&str, &str)> = vec![
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+        ("grant_type", "refresh_token"),
+        ("scope", "account_info offline_access minecraft_server_session"),
+        ("refresh_token", refresh_token),
+    ];
+    let response = match request_to("POST", url)
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .send_form(&form)
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(ureq::Error::Transport(_)) => {
+            return Err("Could not reach ely.by. Check your internet connection.".into())
+        }
+    };
+    let status = response.status();
+    let text = response.into_string().unwrap_or_default();
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if status >= 400 {
+        let why = str_field(&v, "error_description").unwrap_or_else(|| str_field(&v, "error").unwrap_or_default());
+        return Err(format!("ely.by refused the refresh: {why}"));
+    }
+    let access = str_field(&v, "access_token").ok_or("No access_token from ely.by")?;
+    let refresh = str_field(&v, "refresh_token").unwrap_or_else(|| refresh_token.to_owned());
+    let expires = v
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(86400);
+    Ok((access, refresh, expires))
+}
+
 /// A sign-in on its own thread, from the fields to the saved account. The window shows
 /// `state()`; a Totp step makes it show the code field.
 pub struct SignIn {
@@ -290,5 +483,36 @@ mod tests {
     fn secrets_never_show_tokens() {
         let (_, secrets) = response_profile(&profile_body()).unwrap();
         assert!(!format!("{secrets:?}").contains("ely-token"));
+    }
+
+    #[test]
+    fn oauth_url_encodes_and_requests_minecraft_session() {
+        let url = oauth_authorize_url("ely", "http://127.0.0.1:45678/oauth", "abc 123");
+        assert!(url.starts_with("https://account.ely.by/oauth2/v1?"));
+        assert!(url.contains("client_id=ely"));
+        assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A45678%2Foauth"));
+        assert!(url.contains("scope="));
+        assert!(url.contains("offline_access"));
+        assert!(url.contains("minecraft_server_session"));
+        assert!(url.contains("state=abc%20123"));
+        assert!(url.contains("response_type=code"));
+    }
+
+    #[test]
+    fn oauth_callback_parses_code_and_state() {
+        let (code, state) =
+            parse_callback("/oauth?code=dkpEEVtXBdIcgdQWak4SOPEpTJIvYa8KIq5cW9GJ&state=abc123")
+                .unwrap();
+        assert_eq!(code, "dkpEEVtXBdIcgdQWak4SOPEpTJIvYa8KIq5cW9GJ");
+        assert_eq!(state, "abc123");
+        assert!(parse_callback("/oauth?error=access_denied").is_none());
+        assert!(parse_callback("/oauth").is_none());
+    }
+
+    #[test]
+    fn percent_encode_keeps_unreserved() {
+        assert_eq!(percent_encode("abc-._~123"), "abc-._~123");
+        assert_eq!(percent_encode("a b"), "a%20b");
+        assert_eq!(percent_encode("ё"), "%D1%91");
     }
 }

@@ -95,6 +95,12 @@ enum AccountCmd {
         /// Sign in with an ely.by account instead of Microsoft
         #[arg(long)]
         ely: bool,
+        /// Sign in with ely.by's OAuth flow (opens the browser;
+        /// client id/secret from HORIZON_ELYBY_OAUTH_CLIENT_ID and
+        /// HORIZON_ELYBY_OAUTH_CLIENT_SECRET, redirect uri default
+        /// http://127.0.0.1:45678/oauth)
+        #[arg(long)]
+        ely_oauth: bool,
         /// ely.by e-mail or username (with --ely)
         #[arg(long)]
         username: Option<String>,
@@ -1471,10 +1477,58 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
         }
         AccountCmd::SignIn {
             ely,
+            ely_oauth,
             username,
             password,
         } => {
-            if ely {
+            if ely_oauth {
+                let client_id = std::env::var("HORIZON_ELYBY_OAUTH_CLIENT_ID")
+                    .map_err(|_| "Set HORIZON_ELYBY_OAUTH_CLIENT_ID to your ely.by OAuth application's client id.")?;
+                let client_secret = std::env::var("HORIZON_ELYBY_OAUTH_CLIENT_SECRET")
+                    .map_err(|_| "Set HORIZON_ELYBY_OAUTH_CLIENT_SECRET to your ely.by OAuth application's client secret.")?;
+                let redirect_uri = std::env::var("HORIZON_ELYBY_OAUTH_REDIRECT_URI")
+                    .unwrap_or_else(|_| "http://127.0.0.1:45678/oauth".into());
+                let port = redirect_uri
+                    .rsplit(':')
+                    .next()
+                    .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+                    .unwrap_or(45678);
+                let state = format!("{:016x}", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0));
+                let url = horizon_launcher::account::elyby::oauth_authorize_url(
+                    &client_id,
+                    &redirect_uri,
+                    &state,
+                );
+                println!("Open this URL in a browser to sign in with ely.by:\n{url}");
+                horizon_launcher::account::elyby::open_browser(&url)?;
+                let (code, returned_state) = horizon_launcher::account::elyby::listen_for_code(port)?;
+                if returned_state != state {
+                    return Err("The OAuth state did not match; try again.".into());
+                }
+                let (access, refresh, expires) =
+                    horizon_launcher::account::elyby::oauth_exchange(
+                        &client_id,
+                        &client_secret,
+                        &redirect_uri,
+                        &code,
+                    )?;
+                let (uuid, name) = horizon_launcher::account::elyby::oauth_account_info(&access)?;
+                let account = account::Account {
+                    uuid: uuid.replace('-', "").to_lowercase(),
+                    name: name.clone(),
+                    skin: horizon_launcher::account::elyby::skin_for(&name),
+                    cape: None,
+                    kind: account::AccountKind::Elyby,
+                };
+                let secrets = account::Secrets::elyby_oauth(access, refresh, expires);
+                accounts.add(account::store(), account.clone(), &secrets)?;
+                accounts.selected = Some(account.uuid);
+                accounts.save()?;
+                println!("Signed in {} via ely.by OAuth.", account.name);
+            } else if ely {
                 let username = username.ok_or("You must pass --username for an ely.by sign-in.")?;
                 let password = password.ok_or("You must pass --password for an ely.by sign-in.")?;
                 let client_token =
